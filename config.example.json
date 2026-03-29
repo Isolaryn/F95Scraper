@@ -1,0 +1,10 @@
+{
+    "cookies": {
+        "xf_csrf": "YOUR_CSRF_TOKEN",
+        "xf_user": "YOUR_USER_COOKIE",
+        "xf_session": "YOUR_SESSION_COOKIE"
+    },
+    "rows_per_page": 90,
+    "delay_between_requests": 0.5,
+    "categories": ["games"]
+}
