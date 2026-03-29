@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Database files
+f95zone.db
+f95zone.db-shm
+f95zone.db-wal
+
+# Config contains cookies/credentials
+config.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Claude Code
+.claude/plans/
