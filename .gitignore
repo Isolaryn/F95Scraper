@@ -6,6 +6,12 @@ __pycache__/
 f95zone.db
 f95zone.db-shm
 f95zone.db-wal
+user_data.db
+user_data.db-shm
+user_data.db-wal
+
+# User settings
+settings.json
 
 # Config contains cookies/credentials
 config.json
