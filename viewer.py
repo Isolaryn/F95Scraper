@@ -4,6 +4,7 @@ import json
 import sys
 import sqlite3
 import threading
+import time
 import webbrowser
 from collections import OrderedDict
 from pathlib import Path
@@ -23,7 +24,7 @@ from PySide6.QtWidgets import (
     QListView, QAbstractItemView, QScrollArea, QSlider, QLineEdit,
     QComboBox, QCheckBox, QRadioButton, QButtonGroup, QPushButton,
     QLabel, QFrame, QCompleter, QStyleOptionViewItem, QStyledItemDelegate,
-    QMenu, QInputDialog,
+    QMenu, QInputDialog, QSplitter,
 )
 
 DB_PATH = Path(__file__).parent / "f95zone.db"
@@ -36,8 +37,23 @@ MIN_CARD_W = 180
 MAX_CARD_W = 600
 CARD_PAD = 8
 
-SORT_OPTIONS = ["Date", "Rating", "Views", "Likes", "Title", "My Rating"]
+COMPUTED_SORT_OPTIONS = ["Balanced Score", "Quality Score", "Trending"]
+FIELD_SORT_OPTIONS = ["Date", "Rating", "Views", "Likes", "Title", "My Rating"]
+SORT_OPTIONS = COMPUTED_SORT_OPTIONS + FIELD_SORT_OPTIONS
 SORT2_OPTIONS = ["None"] + SORT_OPTIONS
+SORT_TOOLTIPS = {
+    "Balanced Score": (
+        "Blends confidence-weighted rating with bounded likes and views. "
+        "Best default for quality without letting old mega-popular games dominate."
+    ),
+    "Quality Score": (
+        "Bayesian rating: high ratings need enough likes to outrank established games. "
+        "Reduces low-played 5-star outliers."
+    ),
+    "Trending": (
+        "Balanced Score with a recency boost. Useful with Max days old for finding fresh strong updates."
+    ),
+}
 STATUS_OPTIONS = ["played", "playing", "dropped", "wishlist"]
 STATUS_COLORS = {
     "played": "#4caf50", "playing": "#42a5f5",
@@ -127,11 +143,43 @@ _SORT_COL_MAP = {
     "Likes": "i.likes", "Title": "i.title", "My Rating": "um.my_rating",
 }
 
+_GLOBAL_AVG_RATING_SQL = "(SELECT AVG(rating) FROM f95.items WHERE rating IS NOT NULL)"
+_BAYESIAN_RATING_SQL = (
+    "((COALESCE(i.rating, 0) * COALESCE(i.likes, 0)) + "
+    f"(COALESCE({_GLOBAL_AVG_RATING_SQL}, 0) * 50.0)) / (COALESCE(i.likes, 0) + 50.0)"
+)
+_LIKES_SIGNAL_SQL = "(5.0 * COALESCE(i.likes, 0) / (COALESCE(i.likes, 0) + 500.0))"
+_VIEWS_SIGNAL_SQL = "(5.0 * COALESCE(i.views, 0) / (COALESCE(i.views, 0) + 1000000.0))"
+_BALANCED_SCORE_SQL = (
+    f"(({_BAYESIAN_RATING_SQL}) * 0.70 + "
+    f"({_LIKES_SIGNAL_SQL}) * 0.20 + "
+    f"({_VIEWS_SIGNAL_SQL}) * 0.10)"
+)
+_AGE_SECONDS_SQL = (
+    "CASE WHEN CAST(strftime('%s','now') AS INTEGER) - COALESCE(i.timestamp, 0) > 0 "
+    "THEN CAST(strftime('%s','now') AS INTEGER) - COALESCE(i.timestamp, 0) ELSE 0 END"
+)
+_RECENCY_SIGNAL_SQL = f"(5.0 * 604800.0 / (604800.0 + ({_AGE_SECONDS_SQL})))"
+
+_COMPUTED_SORT_SQL = {
+    "Quality Score": _BAYESIAN_RATING_SQL,
+    "Balanced Score": _BALANCED_SCORE_SQL,
+    "Trending": f"(({_BALANCED_SCORE_SQL}) * 0.85 + ({_RECENCY_SIGNAL_SQL}) * 0.15)",
+}
+
+
+def sort_expression(name: str) -> str:
+    return _COMPUTED_SORT_SQL.get(name) or _SORT_COL_MAP.get(name, "i.timestamp")
+
 
 def build_query(filters, count_only=False):
     sel = "COUNT(*)" if count_only else (
         "i.thread_id, i.title, i.creator, i.version, "
         "i.rating, i.views, i.likes, i.cover_url, i.date_text, "
+        "(SELECT GROUP_CONCAT(url, char(10)) FROM ("
+        "SELECT url FROM f95.item_screens s WHERE s.thread_id = i.thread_id "
+        "ORDER BY COALESCE(position, 0), url"
+        ")) AS screen_urls, "
         "um.status, um.my_rating, um.notes"
     )
     sql = f"SELECT {sel} FROM f95.items i"
@@ -210,6 +258,11 @@ def build_query(filters, count_only=False):
             wheres.append(f"{col} {op} ?")
             params.append(val)
 
+    max_days_old = filters.get("max_days_old")
+    if max_days_old is not None:
+        wheres.append("i.timestamp >= ?")
+        params.append(int(time.time()) - (max_days_old * 86400))
+
     # Status filter
     statuses = filters.get("statuses")
     if statuses is not None:
@@ -228,13 +281,14 @@ def build_query(filters, count_only=False):
         sql += " WHERE " + " AND ".join(wheres)
 
     if not count_only:
-        sort_col = _SORT_COL_MAP.get(filters.get("sort", "Date"), "i.timestamp")
+        sort_name = filters.get("sort", "Date")
+        sort_col = sort_expression(sort_name)
         order = "ASC" if filters.get("order") == "Ascending" else "DESC"
         order_clause = f"{sort_col} {order}"
 
         sort2 = filters.get("sort2")
         if sort2 and sort2 != "None":
-            sort2_col = _SORT_COL_MAP.get(sort2)
+            sort2_col = sort_expression(sort2)
             if sort2_col and sort2_col != sort_col:
                 order_clause += f", {sort2_col} {order}"
 
@@ -352,12 +406,14 @@ class CardModel(QAbstractListModel):
     StatusRole    = Qt.UserRole + 10
     MyRatingRole  = Qt.UserRole + 11
     NotesRole     = Qt.UserRole + 12
+    ScreenUrlsRole = Qt.UserRole + 13
 
     _ROLE_MAP = {
         ThreadIdRole: "thread_id", TitleRole: "title", CreatorRole: "creator",
         RatingRole: "rating", ViewsRole: "views", CoverUrlRole: "cover_url",
         VersionRole: "version", DateTextRole: "date_text", LikesRole: "likes",
         StatusRole: "status", MyRatingRole: "my_rating", NotesRole: "notes",
+        ScreenUrlsRole: "screen_urls",
     }
 
     def __init__(self, parent=None):
@@ -411,6 +467,7 @@ class CardDelegate(QStyledItemDelegate):
         self._cache = image_cache
         self._card_w = DEFAULT_CARD_W
         self._hovered_index: QModelIndex | None = None
+        self._preview_indexes: dict[int, int] = {}
 
         self._title_font = QFont("Segoe UI", 9)
         self._title_font.setBold(True)
@@ -437,6 +494,49 @@ class CardDelegate(QStyledItemDelegate):
 
     def set_hovered(self, index: QModelIndex | None):
         self._hovered_index = index
+
+    def preview_urls(self, index: QModelIndex) -> list[str]:
+        urls: list[str] = []
+        cover_url = index.data(CardModel.CoverUrlRole)
+        if cover_url:
+            urls.append(cover_url)
+        screen_urls = index.data(CardModel.ScreenUrlsRole) or ""
+        for url in str(screen_urls).splitlines():
+            url = url.strip()
+            if url and url not in urls:
+                urls.append(url)
+        return urls
+
+    def current_preview_url(self, index: QModelIndex) -> str | None:
+        urls = self.preview_urls(index)
+        if not urls:
+            return None
+        tid = index.data(CardModel.ThreadIdRole)
+        current = self._preview_indexes.get(tid, 0) if tid is not None else 0
+        current = max(0, min(current, len(urls) - 1))
+        return urls[current]
+
+    def preview_nav_action(self, index: QModelIndex, item_rect: QRect, pos: QPoint) -> int:
+        urls = self.preview_urls(index)
+        if len(urls) <= 1:
+            return 0
+        thumb_rect = QRect(item_rect.x() + 8, item_rect.y() + 8, self._thumb_w, self._thumb_h)
+        if not thumb_rect.contains(pos):
+            return 0
+        nav_w = min(46, max(28, thumb_rect.width() // 5))
+        if pos.x() <= thumb_rect.left() + nav_w:
+            return -1
+        if pos.x() >= thumb_rect.right() - nav_w:
+            return 1
+        return 0
+
+    def step_preview(self, index: QModelIndex, direction: int):
+        urls = self.preview_urls(index)
+        tid = index.data(CardModel.ThreadIdRole)
+        if len(urls) <= 1 or tid is None:
+            return
+        current = self._preview_indexes.get(tid, 0)
+        self._preview_indexes[tid] = (current + direction) % len(urls)
 
     def sizeHint(self, option, index):
         return QSize(self._card_w, self._card_h)
@@ -466,12 +566,40 @@ class CardDelegate(QStyledItemDelegate):
 
         # Thumbnail
         thumb_rect = QRect(x0 + 8, y0 + 8, tw, th)
-        url = index.data(CardModel.CoverUrlRole)
+        url = self.current_preview_url(index)
         pm = self._cache.get_pixmap(url, tw, th) if url else None
         if pm:
             painter.drawPixmap(thumb_rect, pm)
         else:
             painter.fillRect(thumb_rect, THUMB_BG)
+
+        preview_urls = self.preview_urls(index)
+        if len(preview_urls) > 1:
+            tid = index.data(CardModel.ThreadIdRole)
+            current = self._preview_indexes.get(tid, 0) if tid is not None else 0
+            current = max(0, min(current, len(preview_urls) - 1))
+
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 145))
+            left_btn = QRect(thumb_rect.left() + 6, thumb_rect.center().y() - 16, 26, 32)
+            right_btn = QRect(thumb_rect.right() - 32, thumb_rect.center().y() - 16, 26, 32)
+            painter.drawRoundedRect(left_btn, 4, 4)
+            painter.drawRoundedRect(right_btn, 4, 4)
+
+            painter.setFont(self._rating_font)
+            painter.setPen(QColor(TEXT))
+            painter.drawText(left_btn, Qt.AlignCenter, "<")
+            painter.drawText(right_btn, Qt.AlignCenter, ">")
+
+            count_text = f"{current + 1}/{len(preview_urls)}"
+            count_w = QFontMetrics(self._rating_font).horizontalAdvance(count_text) + 14
+            count_rect = QRect(thumb_rect.right() - count_w - 6, thumb_rect.bottom() - 24,
+                               count_w, 18)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 150))
+            painter.drawRoundedRect(count_rect, 4, 4)
+            painter.setPen(QColor(TEXT))
+            painter.drawText(count_rect, Qt.AlignCenter, count_text)
 
         # Status indicator dot (top-right corner of card)
         status = index.data(CardModel.StatusRole)
@@ -719,11 +847,13 @@ class FilterSidebar(QScrollArea):
     filtersApplied = Signal()
     filtersReset = Signal()
     tileSizeChanged = Signal(int)
+    presetsChanged = Signal()
 
     def __init__(self, all_tags: list[str], prefix_groups: dict[str, list],
                  user_tags: list[str], parent=None):
         super().__init__(parent)
-        self.setFixedWidth(250)
+        self.setMinimumWidth(220)
+        self.setMaximumWidth(520)
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setFrameShape(QFrame.NoFrame)
@@ -734,6 +864,7 @@ class FilterSidebar(QScrollArea):
         self.all_user_tags = user_tags
         self.selected_user_tags: list[str] = []
         self.status_vars: dict[str, QCheckBox] = {}
+        self._filter_presets: dict[str, dict] = {}
 
         inner = QWidget()
         self._layout = QVBoxLayout(inner)
@@ -754,6 +885,18 @@ class FilterSidebar(QScrollArea):
         line.setFrameShape(QFrame.HLine)
         line.setStyleSheet(f"color: {BORDER};")
         self._layout.addWidget(line)
+
+    def _populate_sort_combo(self, combo: QComboBox, include_none=False):
+        if include_none:
+            combo.addItem("None")
+            combo.insertSeparator(combo.count())
+        for label in COMPUTED_SORT_OPTIONS:
+            combo.addItem(label)
+            row = combo.count() - 1
+            combo.model().setData(combo.model().index(row, 0),
+                                  SORT_TOOLTIPS[label], Qt.ToolTipRole)
+        combo.insertSeparator(combo.count())
+        combo.addItems(FIELD_SORT_OPTIONS)
 
     def _build(self, prefix_groups):
         # Tile size
@@ -791,7 +934,7 @@ class FilterSidebar(QScrollArea):
         sort_layout.setContentsMargins(0, 0, 0, 0)
         sort_layout.setSpacing(6)
         self.sort_combo = QComboBox()
-        self.sort_combo.addItems(SORT_OPTIONS)
+        self._populate_sort_combo(self.sort_combo)
         sort_layout.addWidget(self.sort_combo)
         self.order_combo = QComboBox()
         self.order_combo.addItems(["Descending", "Ascending"])
@@ -808,7 +951,7 @@ class FilterSidebar(QScrollArea):
         then_lbl.setStyleSheet(f"color: {TEXT_DIM};")
         sort2_layout.addWidget(then_lbl)
         self.sort2_combo = QComboBox()
-        self.sort2_combo.addItems(SORT2_OPTIONS)
+        self._populate_sort_combo(self.sort2_combo, include_none=True)
         sort2_layout.addWidget(self.sort2_combo)
         sort2_layout.addStretch()
         self._layout.addWidget(sort2_row)
@@ -911,6 +1054,22 @@ class FilterSidebar(QScrollArea):
         views_layout.addWidget(self.views_max)
         views_layout.addStretch()
         self._layout.addWidget(views_row)
+
+        self._heading("UPDATED")
+        max_days_row = QWidget()
+        max_days_layout = QHBoxLayout(max_days_row)
+        max_days_layout.setContentsMargins(0, 0, 0, 0)
+        max_days_layout.setSpacing(6)
+        self.max_days_old = QLineEdit()
+        self.max_days_old.setPlaceholderText("Max days old")
+        self.max_days_old.setFixedWidth(105)
+        max_days_layout.addWidget(self.max_days_old)
+        days_lbl = QLabel("days")
+        days_lbl.setFont(QFont("Segoe UI", 8))
+        days_lbl.setStyleSheet(f"color: {TEXT_DIM};")
+        max_days_layout.addWidget(days_lbl)
+        max_days_layout.addStretch()
+        self._layout.addWidget(max_days_row)
         self._sep()
 
         # ── User data filters ──
@@ -982,6 +1141,35 @@ class FilterSidebar(QScrollArea):
         self.user_chips_layout.setContentsMargins(0, 0, 0, 0)
         self.user_chips_layout.setSpacing(2)
         self._layout.addWidget(self.user_chips_widget)
+        self._sep()
+
+        # Presets
+        self._heading("FILTER PRESETS")
+        self.preset_combo = QComboBox()
+        self.preset_combo.setPlaceholderText("Saved filters")
+        self._layout.addWidget(self.preset_combo)
+
+        preset_row = QWidget()
+        preset_layout = QHBoxLayout(preset_row)
+        preset_layout.setContentsMargins(0, 0, 0, 0)
+        preset_layout.setSpacing(4)
+
+        self.load_preset_btn = QPushButton("Load")
+        self.load_preset_btn.setCursor(Qt.PointingHandCursor)
+        self.load_preset_btn.clicked.connect(self._load_selected_preset)
+        preset_layout.addWidget(self.load_preset_btn)
+
+        self.save_preset_btn = QPushButton("Save")
+        self.save_preset_btn.setCursor(Qt.PointingHandCursor)
+        self.save_preset_btn.clicked.connect(self._save_current_preset)
+        preset_layout.addWidget(self.save_preset_btn)
+
+        self.delete_preset_btn = QPushButton("Delete")
+        self.delete_preset_btn.setCursor(Qt.PointingHandCursor)
+        self.delete_preset_btn.clicked.connect(self._delete_selected_preset)
+        preset_layout.addWidget(self.delete_preset_btn)
+
+        self._layout.addWidget(preset_row)
         self._sep()
 
         # Buttons
@@ -1089,6 +1277,28 @@ class FilterSidebar(QScrollArea):
 
     # ── Gather / restore ──
 
+    def _filter_state(self) -> dict:
+        return {
+            "title": self.title_edit.text(),
+            "creator": self.creator_edit.text(),
+            "sort": self.sort_combo.currentText(),
+            "sort2": self.sort2_combo.currentText(),
+            "order": self.order_combo.currentText(),
+            "prefix_ids": [pid for pid, cb in self.prefix_vars.items() if cb.isChecked()],
+            "tags": list(self.selected_tags),
+            "tag_mode": "AND" if self.tag_mode_and.isChecked() else "OR",
+            "rating_min": self.rating_min.text(),
+            "rating_max": self.rating_max.text(),
+            "views_min": self.views_min.text(),
+            "views_max": self.views_max.text(),
+            "max_days_old": self.max_days_old.text(),
+            "statuses": [s for s, cb in self.status_vars.items() if cb.isChecked()],
+            "my_rating_min": self.my_rating_min.text(),
+            "my_rating_max": self.my_rating_max.text(),
+            "user_tags": list(self.selected_user_tags),
+            "user_tag_mode": "AND" if self.user_tag_mode_and.isChecked() else "OR",
+        }
+
     def gather_filters(self) -> dict:
         f: dict = {
             "title": self.title_edit.text(),
@@ -1128,6 +1338,15 @@ class FilterSidebar(QScrollArea):
         if checked_statuses:
             f["statuses"] = checked_statuses
 
+        val = self.max_days_old.text().strip()
+        if val:
+            try:
+                days = int(val)
+                if days >= 0:
+                    f["max_days_old"] = days
+            except ValueError:
+                pass
+
         if self.selected_user_tags:
             f["user_tags"] = list(self.selected_user_tags)
             f["user_tag_mode"] = "AND" if self.user_tag_mode_and.isChecked() else "OR"
@@ -1136,26 +1355,23 @@ class FilterSidebar(QScrollArea):
 
     def get_full_state(self) -> dict:
         """Return all widget state for persistence."""
-        return {
+        state = {
             "tile_size": self.tile_slider.value(),
-            "title": self.title_edit.text(),
-            "creator": self.creator_edit.text(),
-            "sort": self.sort_combo.currentText(),
-            "sort2": self.sort2_combo.currentText(),
-            "order": self.order_combo.currentText(),
-            "prefix_ids": [pid for pid, cb in self.prefix_vars.items() if cb.isChecked()],
-            "tags": list(self.selected_tags),
-            "tag_mode": "AND" if self.tag_mode_and.isChecked() else "OR",
-            "rating_min": self.rating_min.text(),
-            "rating_max": self.rating_max.text(),
-            "views_min": self.views_min.text(),
-            "views_max": self.views_max.text(),
-            "statuses": [s for s, cb in self.status_vars.items() if cb.isChecked()],
-            "my_rating_min": self.my_rating_min.text(),
-            "my_rating_max": self.my_rating_max.text(),
-            "user_tags": list(self.selected_user_tags),
-            "user_tag_mode": "AND" if self.user_tag_mode_and.isChecked() else "OR",
+            "filter_presets": self.get_presets(),
         }
+        state.update(self._filter_state())
+        return state
+
+    def get_presets(self) -> dict:
+        return {name: dict(state) for name, state in self._filter_presets.items()}
+
+    def set_presets(self, presets: dict | None):
+        self._filter_presets = {
+            str(name): dict(state)
+            for name, state in (presets or {}).items()
+            if isinstance(state, dict)
+        }
+        self._refresh_preset_combo()
 
     def restore_state(self, data: dict):
         """Restore widget state from a saved dict."""
@@ -1189,6 +1405,7 @@ class FilterSidebar(QScrollArea):
         self.rating_max.setText(data.get("rating_max", ""))
         self.views_min.setText(data.get("views_min", ""))
         self.views_max.setText(data.get("views_max", ""))
+        self.max_days_old.setText(data.get("max_days_old", ""))
 
         saved_statuses = set(data.get("statuses", []))
         for s, cb in self.status_vars.items():
@@ -1204,6 +1421,49 @@ class FilterSidebar(QScrollArea):
         else:
             self.user_tag_mode_and.setChecked(True)
 
+    def _refresh_preset_combo(self, selected: str | None = None):
+        current = selected or self.preset_combo.currentText()
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        for name in sorted(self._filter_presets, key=str.casefold):
+            self.preset_combo.addItem(name)
+        idx = self.preset_combo.findText(current)
+        if idx >= 0:
+            self.preset_combo.setCurrentIndex(idx)
+        self.preset_combo.blockSignals(False)
+        has_presets = self.preset_combo.count() > 0
+        self.load_preset_btn.setEnabled(has_presets)
+        self.delete_preset_btn.setEnabled(has_presets)
+
+    def _save_current_preset(self):
+        current = self.preset_combo.currentText()
+        name, ok = QInputDialog.getText(
+            self, "Save Filter Preset", "Preset name:", text=current)
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        self._filter_presets[name] = self._filter_state()
+        self._refresh_preset_combo(name)
+        self.presetsChanged.emit()
+
+    def _load_selected_preset(self):
+        name = self.preset_combo.currentText()
+        preset = self._filter_presets.get(name)
+        if not preset:
+            return
+        self.restore_state({"tile_size": self.tile_slider.value(), **preset})
+        self.filtersApplied.emit()
+
+    def _delete_selected_preset(self):
+        name = self.preset_combo.currentText()
+        if not name:
+            return
+        self._filter_presets.pop(name, None)
+        self._refresh_preset_combo()
+        self.presetsChanged.emit()
+
     def _do_reset(self):
         self.title_edit.clear()
         self.creator_edit.clear()
@@ -1214,6 +1474,7 @@ class FilterSidebar(QScrollArea):
         self.rating_max.clear()
         self.views_min.clear()
         self.views_max.clear()
+        self.max_days_old.clear()
         self.selected_tags.clear()
         self._refresh_chips()
         for cb in self.prefix_vars.values():
@@ -1247,6 +1508,12 @@ QScrollArea {{
 }}
 QScrollArea > QWidget > QWidget {{
     background-color: {SIDEBAR};
+}}
+QSplitter::handle {{
+    background-color: {BORDER};
+}}
+QSplitter::handle:hover {{
+    background-color: {ACCENT};
 }}
 QLineEdit {{
     background-color: {ENTRY_BG};
@@ -1451,6 +1718,9 @@ class ViewerApp(QMainWindow):
         self._load_settings()
         self._apply_filters()
 
+        # Smooth scrolling: reduce single step to ~30px instead of full item height
+        self._list_view.verticalScrollBar().setSingleStep(30)
+
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -1458,12 +1728,18 @@ class ViewerApp(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        self._splitter = QSplitter(Qt.Horizontal)
+        self._splitter.setChildrenCollapsible(False)
+        self._splitter.setHandleWidth(8)
+        layout.addWidget(self._splitter)
+
         # Sidebar
         self._sidebar = FilterSidebar(self.all_tags, self.prefix_groups, self.user_tags)
         self._sidebar.filtersApplied.connect(self._apply_filters)
         self._sidebar.filtersReset.connect(self._apply_filters)
         self._sidebar.tileSizeChanged.connect(self._on_tile_resize)
-        layout.addWidget(self._sidebar)
+        self._sidebar.presetsChanged.connect(self._save_settings)
+        self._splitter.addWidget(self._sidebar)
 
         # Card list view
         self._list_view = QListView()
@@ -1487,7 +1763,10 @@ class ViewerApp(QMainWindow):
         self._list_view.clicked.connect(self._on_card_clicked)
         self._list_view.verticalScrollBar().valueChanged.connect(self._on_scroll)
         self._list_view.viewport().installEventFilter(self)
-        layout.addWidget(self._list_view)
+        self._splitter.addWidget(self._list_view)
+        self._splitter.setStretchFactor(0, 0)
+        self._splitter.setStretchFactor(1, 1)
+        self._splitter.setSizes([250, 1350])
 
     # ── Settings persistence ──
 
@@ -1495,24 +1774,45 @@ class ViewerApp(QMainWindow):
         if SETTINGS_PATH.exists():
             try:
                 data = json.loads(SETTINGS_PATH.read_text("utf-8"))
+                self._sidebar.set_presets(data.get("filter_presets"))
                 self._sidebar.restore_state(data)
+                if "window_width" in data and "window_height" in data:
+                    self.resize(data["window_width"], data["window_height"])
+                if "splitter_sizes" in data:
+                    self._splitter.setSizes(data["splitter_sizes"])
             except (json.JSONDecodeError, KeyError):
                 pass
 
     def _save_settings(self):
         data = self._sidebar.get_full_state()
+        data["window_width"] = self.width()
+        data["window_height"] = self.height()
+        data["splitter_sizes"] = self._splitter.sizes()
         SETTINGS_PATH.write_text(json.dumps(data, indent=2), "utf-8")
 
     # ── Events ──
 
     def eventFilter(self, obj, event):
-        if obj is self._list_view.viewport() and event.type() == QEvent.Leave:
-            self._tooltip.hide_tooltip()
-            self._tooltip_timer.stop()
-            self._pending_tooltip_index = None
-            if self._delegate._hovered_index is not None:
-                self._delegate.set_hovered(None)
-                self._list_view.viewport().update()
+        if obj is self._list_view.viewport():
+            if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                index = self._list_view.indexAt(event.pos())
+                if index.isValid():
+                    action = self._delegate.preview_nav_action(
+                        index, self._list_view.visualRect(index), event.pos())
+                    if action:
+                        self._delegate.step_preview(index, action)
+                        self._tooltip.hide_tooltip()
+                        self._list_view.viewport().update(self._list_view.visualRect(index))
+                        event.accept()
+                        return True
+
+            if event.type() == QEvent.Leave:
+                self._tooltip.hide_tooltip()
+                self._tooltip_timer.stop()
+                self._pending_tooltip_index = None
+                if self._delegate._hovered_index is not None:
+                    self._delegate.set_hovered(None)
+                    self._list_view.viewport().update()
         return super().eventFilter(obj, event)
 
     def _on_card_entered(self, index: QModelIndex):
@@ -1677,6 +1977,7 @@ class ViewerApp(QMainWindow):
         self._list_view.viewport().update()
 
     def closeEvent(self, event):
+        self._save_settings()
         self._tooltip.hide_tooltip()
         self._image_cache.shutdown()
         self.db.close()
